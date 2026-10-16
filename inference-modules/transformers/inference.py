@@ -10,7 +10,7 @@ import transformers
 
 from peft import PeftModel
 from schemas import InferenceConfig
-from transformers import PreTrainedTokenizerBase, pipeline
+from transformers import PreTrainedTokenizerBase, PythonBackend, TokenizersBackend, pipeline
 
 from llm_jp_eval.cli import setup_cli
 from llm_jp_eval.schemas import DatasetProfile
@@ -77,10 +77,13 @@ class TransformersGenerator(GeneratorBase[InferenceConfig]):
         prompt_tokens: list,
         prompt_lengths: list,
     ) -> Dict[str, Any]:
+        tokenizer = self.tokenizer
+        if not isinstance(tokenizer, (PythonBackend, TokenizersBackend)):
+            raise TypeError("Expected a Hugging Face tokenizer backend.")
         pipe = pipeline(
             "text-generation",
             model=self.model,
-            tokenizer=self.tokenizer,
+            tokenizer=tokenizer,
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
             max_new_tokens=max_output_len,

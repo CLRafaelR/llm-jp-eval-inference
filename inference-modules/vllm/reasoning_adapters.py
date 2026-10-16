@@ -15,17 +15,55 @@ import logging
 import re
 
 from abc import ABC, abstractmethod
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import vllm
 
 from schemas import ModelConfig
 from transformers import PreTrainedTokenizerBase
+from vllm.entrypoints.generate.base.protocol import FunctionCall
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
-from vllm.entrypoints.openai.parser.harmony_utils import get_encoding, parse_chat_output
+from vllm.entrypoints.openai.parser.harmony_utils import get_encoding
+from vllm.parser.harmony import HarmonyParser
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
+from vllm.reasoning.gptoss_reasoning_parser import GptOssReasoningParser
+from vllm.tokenizers import TokenizerLike
 
 logger = logging.getLogger(__name__)
+
+
+class _OfflineHarmonyParser(HarmonyParser):
+    """Configure vLLM's Harmony parser for direct, offline output parsing."""
+
+    reasoning_parser_cls = GptOssReasoningParser
+
+
+class _HarmonyTokenizerView:
+    """Decode Harmony vocabulary IDs during vLLM parser error recovery."""
+
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, encoding: Any) -> None:
+        self.tokenizer = tokenizer
+        self.encoding = encoding
+
+    def decode(self, token_ids: list[int]) -> str:
+        return self.encoding.decode(token_ids)
+
+    def get_vocab(self) -> dict[str, int]:
+        return self.tokenizer.get_vocab()
+
+
+def _parse_harmony_output(
+    tokenizer: Any,
+    output_token_ids: list[int],
+    output_text: str,
+) -> tuple[str | None, str | None, list[FunctionCall] | None]:
+    """Parse generated Harmony token IDs through vLLM's current parser API."""
+    parser = _OfflineHarmonyParser(tokenizer=tokenizer)
+    return parser.parse(
+        output_text,
+        request=ChatCompletionRequest(messages=[]),
+        model_output_token_ids=output_token_ids,
+    )
 
 
 class ReasoningAdapter(ABC):
@@ -35,8 +73,14 @@ class ReasoningAdapter(ABC):
         self.tokenizer = tokenizer
         # Subclasses may rewrite model_cfg.reasoning_parser before this point
         # if they need vLLM started with a different parser.
-        parser_class = ReasoningParserManager.get_reasoning_parser(model_cfg.reasoning_parser)
-        self.parser = parser_class(tokenizer=tokenizer)
+        parser_name = model_cfg.reasoning_parser
+        if parser_name is None:
+            raise ValueError("reasoning_parser must be configured.")
+        self.parser_class = ReasoningParserManager.get_reasoning_parser(parser_name)
+
+    def initialize_parser(self, tokenizer: TokenizerLike) -> None:
+        """Bind the parser to vLLM's tokenizer after model initialization."""
+        self.parser = self.parser_class(tokenizer=tokenizer)
 
     def adjust_sampling_params(self, sampling_params: vllm.sampling_params.SamplingParams) -> None:  # noqa: B027
         """No-op by default; override to mirror the parser's adjust_request."""
@@ -70,7 +114,7 @@ class GptOssReasoningAdapter(ReasoningAdapter):
     parser_name = "openai_gptoss"
 
     def parse_output(self, output_token_ids: list[int], output_text: str) -> tuple[str | None, str]:
-        reasoning, final, _ = parse_chat_output(output_token_ids)
+        reasoning, final, _ = _parse_harmony_output(self.tokenizer, output_token_ids, output_text)
         if final is None:
             return (None, reasoning) if reasoning else (None, "")
         return reasoning, final
@@ -78,8 +122,7 @@ class GptOssReasoningAdapter(ReasoningAdapter):
 
 class Llmjp4ReasoningAdapter(ReasoningAdapter):
     # llm-jp-4 emits Harmony channels but its tokenizer is not the
-    # openai-harmony vocabulary, so the model's token IDs cannot be fed to
-    # parse_chat_output directly. Decode with special tokens preserved,
+    # openai-harmony vocabulary. Decode with special tokens preserved,
     # collapse the trailing spaces some tokenizers introduce after special
     # tokens, then re-encode through openai-harmony before parsing.
     parser_name = "llmjp4"
@@ -93,10 +136,14 @@ class Llmjp4ReasoningAdapter(ReasoningAdapter):
 
     def parse_output(self, output_token_ids: list[int], output_text: str) -> tuple[str | None, str]:
         text = self.tokenizer.decode(output_token_ids, skip_special_tokens=False)
+        if not isinstance(text, str):
+            raise TypeError("Expected a single decoded string.")
         normalized = self._SPECIAL_TOKEN_TRAILING_SPACE.sub(r"\1", text)
         try:
-            harmony_token_ids = get_encoding().encode(normalized, allowed_special="all")
-            reasoning, final, _ = parse_chat_output(harmony_token_ids)
+            encoding = get_encoding()
+            harmony_token_ids = encoding.encode(normalized, allowed_special="all")
+            harmony_tokenizer = _HarmonyTokenizerView(self.tokenizer, encoding)
+            reasoning, final, _ = _parse_harmony_output(harmony_tokenizer, harmony_token_ids, normalized)
         except Exception as e:
             # Truncated / malformed Harmony output: surface raw text instead
             # of failing the whole batch.

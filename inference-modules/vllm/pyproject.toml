@@ -7,10 +7,15 @@ requires-python = ">=3.11, <3.13"
 dependencies = [
     "llm-jp-eval-inference",
     "torch>=2.10.0",
-    "vllm>=0.19.1",
+    "torchvision",
+    "torchaudio",
+    "vllm",
+    # "vllm>=0.19.1",
     # Gemma 4 系 tokenizer_config.json が `extra_special_tokens` を list で持つのに、
     # transformers 4.x は dict 前提で AttributeError になるため 5.6+ を要求。
     "transformers>=5.6.0",
+    "flash-linear-attention>=0.5.2",
+    "causal-conv1d>=1.7.0",
 ]
 
 [tool.uv]
@@ -30,8 +35,26 @@ override-dependencies = [
     "pydantic-settings>=2.10.1",
     # unbabel-comet は transformers<5 / huggingface-hub<1 を要求するが、推論モジュールでは未使用。
     "transformers>=5.6.0",
-    "huggingface-hub>=1.5.0",
+    "huggingface-hub>=1.31.0,<3.0",
 ]
 
 [tool.uv.sources]
 llm-jp-eval-inference = { path = "../../", editable = true }
+transformers = { git = "https://github.com/huggingface/transformers", branch = "add-jev-models" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
+vllm = { index = "vllm-git-system-one" }
+
+[[tool.uv.index]]
+name = "vllm-git-system-one"
+url = "https://wheels.vllm.ai/6ecb39eaa7c55b26afd39b76a87b44f33053bdff"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]

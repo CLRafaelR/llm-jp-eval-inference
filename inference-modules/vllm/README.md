@@ -1,4 +1,5 @@
 # vLLMによるoffline推論
+
 [ [**English**](./README_en.md) | 日本語 ]
 
 [vLLM](https://github.com/vllm-project/vllm)を用いてプロンプトの推論結果を出力します。
@@ -40,7 +41,6 @@ $ uv run python inference.py inference \
   --prompt_json_path=['../../../local_files/datasets/2.0.0/evaluation/path/to/prompts/*.eval-prompt.json']
 ```
 
-
 主要パラメータを指定して簡易に推論を実行できる [eval.sh](./eval.sh) の使用例。
 
 - 第1引数: MODEL_DIR
@@ -51,4 +51,31 @@ $ uv run python inference.py inference \
 
 ```bash
 $ CUDA_VISIBLE_DEVICES=0,1 ./eval.sh llm-jp/llm-jp-3-13b 2 2048 enable --run_name="13b-vllm-test1"
+```
+
+### 意思決定モデル（System One Model）の推論
+
+`Cloudflare/clef-flash`のような意思決定モデル（System One Model）の推論時は、推論設定の`model`に以下を指定します。なお、通常の生成モデルは `structured_decision` を省略（または `false`）すれば、従来通り `LLM.generate()` で推論します。
+
+```yaml
+# vllm_inference.yaml
+model:
+  model: Cloudflare/clef-flash
+  # Clef is a token-classification decision model, not a text generator.
+  structured_decision: true
+  runner: pooling
+  pooler_config:
+    task: token_classify
+  max_model_len: 16384 # Optional
+
+tokenizer:
+  pretrained_model_name_or_path: Cloudflare/clef-flash
+```
+
+`structured_decision: true`のとき、各ベンチマークサンプルを `state`、データセットの instructionとlabel_listを`questions.answer`に格納します。結果の`answers.answer.choice`は、通常の評価プログラムが読める`generated`として保存されます。
+
+llm-jp-evalでは、次のように推論・評価を実行できます。
+
+```bash
+$ task eval_inference inference_config=configs/vllm_inference.yaml eval_config=configs/system_one_config.yaml
 ```

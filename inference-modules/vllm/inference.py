@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 import os
 import sys
@@ -18,7 +19,9 @@ import vllm.sampling_params
 
 from reasoning_adapters import find_adapter_class
 from schemas import InferenceConfig
-from transformers import PreTrainedTokenizerBase
+from structured_decisions import JointSchemaDecisionEncoder
+from transformers import PreTrainedTokenizerBase, PythonBackend, TokenizersBackend
+from vllm.entrypoints.openai.decisions.question_types import build_question
 from vllm.tokenizers.hf import get_cached_tokenizer
 
 from llm_jp_eval.cli import setup_cli
@@ -72,8 +75,12 @@ class VLLMGenerator(GeneratorBase[InferenceConfig]):
         self.tp = cfg.model.tensor_parallel_size
         self.pp = cfg.model.pipeline_parallel_size
         self.enable_reasoning = False
+        self.structured_decision = cfg.model.structured_decision
+        self.decision_encoder: JointSchemaDecisionEncoder | None = None
 
         self.run_options = []
+        if self.structured_decision:
+            self.run_options.append("structured-decision")
         if cfg.model.enable_prefix_caching:
             self.run_options.append("apc")
         if cfg.model.gpu_memory_utilization is not None:
@@ -102,18 +109,45 @@ class VLLMGenerator(GeneratorBase[InferenceConfig]):
             else:
                 # set model context length
                 self.cfg.model.max_model_len = None
-        self.model: vllm.LLM = vllm.LLM(**self.cfg.model.model_dump())
+        model_kwargs = self.cfg.model.model_dump(exclude={"structured_decision"})
+        self.model: vllm.LLM = vllm.LLM(**model_kwargs)
         # Inject the external tokenizer into vLLM's renderer (replaces deprecated set_tokenizer)
-        self.model.llm_engine.renderer.tokenizer = get_cached_tokenizer(self.tokenizer)
+        tokenizer = self.tokenizer
+        if not isinstance(tokenizer, (PythonBackend, TokenizersBackend)):
+            raise TypeError("Expected a Hugging Face tokenizer backend.")
+        self.model.llm_engine.renderer.tokenizer = get_cached_tokenizer(tokenizer)
+        if self.enable_reasoning:
+            self.reasoning_adapter.initialize_parser(self.model.get_tokenizer())
+        self.max_len = self.model.model_config.max_model_len
+
+        if self.structured_decision:
+            self._configure_structured_decision_model()
+
+    def _configure_structured_decision_model(self) -> None:
+        if self.enable_reasoning:
+            raise ValueError("reasoning_parser cannot be combined with structured_decision.")
+        if self.model.runner_type != "pooling":
+            raise ValueError(
+                "structured_decision requires vLLM's pooling runner. Set model.runner: pooling in the inference config."
+            )
+        if "token_classify" not in self.model.supported_tasks:
+            raise ValueError(
+                "structured_decision requires a model that supports vLLM's token_classify task. "
+                f"Supported tasks: {self.model.supported_tasks}"
+            )
+        self.decision_encoder = JointSchemaDecisionEncoder(self.model.get_tokenizer(), self.max_len)
 
     def generate(
         self,
         max_input_len: int,
         max_output_len: int,
         target_data: Dict[str, Any],
-        prompt_tokens: list,
-        prompt_lengths: list,
+        prompt_tokens: list[list[int]],
+        prompt_lengths: list[int],
     ) -> Dict[str, Any]:
+        if self.structured_decision:
+            return self._generate_structured_decisions(target_data)
+
         sampling_params = vllm.sampling_params.SamplingParams(**self.cfg.generation_config.model_dump())
         if self.enable_reasoning:
             self.reasoning_adapter.adjust_sampling_params(sampling_params)
@@ -133,13 +167,11 @@ class VLLMGenerator(GeneratorBase[InferenceConfig]):
         with torch.inference_mode():
             results = copy.deepcopy(target_data)
             # prompt_tokens: List[List[int]]
-            outputs = self.model.generate(
-                sampling_params=sampling_params, prompts=[{"prompt_token_ids": tokens} for tokens in prompt_tokens]
-            )
+            outputs = self.model.generate(sampling_params=sampling_params, prompts=prompt_tokens)
             for i, output in enumerate(outputs):
                 if self.enable_reasoning:
                     reasoning_content, content = self.reasoning_adapter.parse_output(
-                        output.outputs[0].token_ids, output.outputs[0].text
+                        list(output.outputs[0].token_ids), output.outputs[0].text
                     )
                     results["samples"][i]["reasoning_content"] = (
                         reasoning_content.lstrip() if reasoning_content else None
@@ -147,6 +179,72 @@ class VLLMGenerator(GeneratorBase[InferenceConfig]):
                     results["samples"][i]["generated"] = content.lstrip() if content else ""
                 else:
                     results["samples"][i]["generated"] = output.outputs[0].text
+        return results
+
+    def _generate_structured_decisions(self, target_data: Dict[str, Any]) -> Dict[str, Any]:
+        if self.decision_encoder is None:
+            raise RuntimeError("The structured-decision encoder was not initialized.")
+
+        label_list = target_data.get("label_list")
+        if not label_list:
+            raise ValueError(
+                f"{target_data['target_dataset']} has no label_list and cannot be evaluated as a choice decision."
+            )
+
+        criteria = {str(label): None for label in label_list}
+        if len(criteria) != len(label_list):
+            raise ValueError(f"{target_data['target_dataset']} has duplicate labels: {label_list}")
+
+        encoded_decisions = [
+            self.decision_encoder.encode(
+                state=sample["input"],
+                questions={
+                    "answer": {
+                        "type": "choice",
+                        "instructions": target_data["instruction"],
+                        "criteria": criteria,
+                    }
+                },
+            )
+            for sample in target_data["samples"]
+        ]
+
+        pooling_params = [
+            vllm.PoolingParams(
+                task="token_classify",
+                extra_kwargs={"joint_schema": encoded.joint_schema},
+            )
+            for encoded in encoded_decisions
+        ]
+        outputs = self.model.encode(
+            [encoded.prompt_token_ids for encoded in encoded_decisions],
+            pooling_params=pooling_params,
+            pooling_task="token_classify",
+        )
+        if len(outputs) != len(encoded_decisions):
+            raise RuntimeError(f"Expected {len(encoded_decisions)} decision outputs, got {len(outputs)}.")
+
+        results = copy.deepcopy(target_data)
+        for sample, encoded, output in zip(results["samples"], encoded_decisions, outputs, strict=True):
+            if len(encoded.questions) != 1 or encoded.questions[0].id != "answer":
+                raise ValueError("Each benchmark sample must contain exactly one 'answer' question.")
+
+            encoded_question = encoded.questions[0]
+            question = build_question(
+                qid=encoded_question.id,
+                type_name="choice",
+                instructions=target_data["instruction"],
+                criteria=dict.fromkeys(encoded_question.option_ids),
+                max_options=26,
+            )
+            probabilities = output.outputs.data.tolist()
+            if len(probabilities) != len(question.options):
+                raise RuntimeError(f"Expected {len(question.options)} option probabilities, got {len(probabilities)}.")
+            # The /v1/systemone joint-schema strategy also uses label_mass=1.0.
+            answer = question.type.answer(question, probabilities, label_mass=1.0)
+            response = {"answers": {"answer": answer}}
+            sample["generated"] = json.dumps(response, ensure_ascii=False)
+            sample["structured_decision"] = {"answer": answer}
         return results
 
 
